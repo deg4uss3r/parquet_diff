@@ -256,14 +256,21 @@ fn main() {
                                     .expected_items(2_000_000_000)
                             },
                             |local_names, record| {
-                                let fuck = record.unwrap();
-                                let wow = fuck
+                                let record_batch = record.unwrap();
+
+                                let record_arrays = record_batch
                                     .column(0)
                                     .as_any()
                                     .downcast_ref::<StringArray>()
                                     .unwrap();
-                                let file_name = wow.value(0);
-                                local_names.insert(&file_name);
+
+                                record_arrays.iter().par_bridge().into_par_iter().for_each(
+                                    |record| {
+                                        if let Some(file_name) = record {
+                                            local_names.insert(file_name);
+                                        }
+                                    },
+                                );
 
                                 local_names
                             },
@@ -351,17 +358,33 @@ fn main() {
                         .par_bridge()
                         .into_par_iter()
                         .map(|record| {
-                            let fuck = record.unwrap();
-                            let wow = fuck
+                            let record_batch = record.unwrap();
+                            let record_arrays = record_batch
                                 .column(0)
                                 .as_any()
                                 .downcast_ref::<StringArray>()
                                 .unwrap();
-                            wow.value(0).to_string()
+
+                            record_arrays
+                                .iter()
+                                .par_bridge()
+                                .into_par_iter()
+                                .filter(|x| x.is_some())
+                                .map(|z| z.unwrap())
+                                .filter(|y| !file_names.contains(*y))
+                                .fold(HashSet::new, |mut missing_files, x| {
+                                    missing_files.insert(x.to_string());
+
+                                    missing_files
+                                })
+                                .reduce(HashSet::new, |mut global, locals| {
+                                    global.extend(locals);
+
+                                    global
+                                })
                         })
-                        .filter(|file| !file_names.contains(file))
                         .fold(HashSet::new, |mut local_missing, missing_file| {
-                            local_missing.insert(missing_file);
+                            local_missing.extend(missing_file);
                             local_missing
                         })
                         .reduce(HashSet::new, |mut global, locals| {
