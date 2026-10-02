@@ -1,0 +1,331 @@
+use std::borrow::Borrow;
+use std::fs;
+use std::hash::Hash;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use clap::Parser;
+use fastbloom::{AtomicBloomFilter, BloomFilter};
+use hashbrown::HashSet;
+use parquet::{
+    errors::ParquetError,
+    file::reader::{FileReader, SerializedFileReader},
+    record::{Row, RowAccessor},
+};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+enum Container<T> {
+    Hash(HashSet<T>),
+    Bloom(BloomFilter),
+    ParHash(Mutex<HashSet<T>>),
+    ParBloom(AtomicBloomFilter),
+}
+
+#[allow(clippy::multiple_bound_locations)]
+impl<T: Hash + Eq> Container<T> {
+    fn insert(&mut self, value: T) {
+        match self {
+            Self::Hash(set) => set.insert(value),
+            Self::Bloom(filter) => filter.insert(&value),
+            Self::ParHash(m_set) => {
+                let lock = m_set.get_mut().unwrap();
+                lock.insert(value)
+            }
+            Self::ParBloom(m_filter) => m_filter.insert(&value),
+        };
+    }
+
+    fn contains<Q: ?Sized>(&self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        match self {
+            Self::Hash(set) => set.contains(value),
+            Self::Bloom(filter) => filter.contains(value),
+            Self::ParHash(m_set) => {
+                let lock = m_set.lock().unwrap();
+                lock.contains(value)
+            }
+            Self::ParBloom(m_filter) => m_filter.contains(value),
+        }
+    }
+
+    fn new(bloom: bool, parallel: bool) -> Self
+    where
+        T: Hash + Eq,
+    {
+        match (bloom, parallel) {
+            (true, true) => Self::ParBloom(
+                AtomicBloomFilter::with_false_pos(0.001).expected_items(2_000_000_000),
+            ),
+            (true, false) => {
+                Self::Bloom(BloomFilter::with_false_pos(0.001).expected_items(2_000_000_000))
+            }
+            (false, true) => Self::ParHash(Mutex::new(HashSet::new())),
+            (false, false) => Self::Hash(HashSet::new()),
+        }
+    }
+}
+
+// woooo boy this is a little crazy but works for this specific use case
+impl<'a, T: Hash + Eq + Clone + 'a> Container<T> {
+    fn extend<Q: IntoIterator<Item = &'a T> + Iterator<Item = &'a T>>(&mut self, value: Q)
+    where
+        T: Hash + Eq + Clone,
+    {
+        match self {
+            Self::Hash(set) => set.extend(value.cloned()),
+            Self::Bloom(filter) => filter.insert_all(value),
+            Self::ParHash(m_set) => {
+                let lock = m_set.get_mut().unwrap();
+                lock.extend(value.cloned());
+            }
+            Self::ParBloom(m_filter) => m_filter.insert_all(value),
+        }
+    }
+}
+
+impl<T: Hash + Eq> From<HashSet<T>> for Container<T> {
+    fn from(value: HashSet<T>) -> Self {
+        Container::Hash(value)
+    }
+}
+
+impl<T: Hash + Eq> From<Mutex<HashSet<T>>> for Container<T> {
+    fn from(value: Mutex<HashSet<T>>) -> Self {
+        Container::ParHash(value)
+    }
+}
+
+impl<T: Hash + Eq> From<BloomFilter> for Container<T> {
+    fn from(value: BloomFilter) -> Self {
+        Container::Bloom(value)
+    }
+}
+
+impl<T: Hash + Eq> From<AtomicBloomFilter> for Container<T> {
+    fn from(value: AtomicBloomFilter) -> Self {
+        Container::ParBloom(value)
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// left, the baseline (this should should have less content)
+    /// automatic detection for a folder of parquet files or a single parquet file
+    #[arg(short, long)]
+    left: String,
+
+    /// right, the comparison (this should have more content)
+    /// automatic detection for a folder of parquet files or a single parquet file
+    #[arg(short, long)]
+    right: String,
+
+    /// file to write the diff to (will output in a list, json format)
+    #[arg(short, long)]
+    output: String,
+
+    /// use a bloomfilter instead of a hashset
+    #[arg(short, long)]
+    bloomfilter: bool,
+
+    /// use parallel iterators
+    #[arg(short, long)]
+    parallel: bool,
+
+    /// number of threads to use
+    /// warning if not supplied it will use them all, depending on how much data you are parsing
+    /// this will probably eat all of your RAM quickly...
+    #[arg(short, long)]
+    num_threads: Option<u32>,
+}
+
+fn find_parquet_files(dir: String) -> Vec<PathBuf> {
+    let dir_iter = std::fs::read_dir(Path::new(&dir)).unwrap();
+    let mut files = vec![];
+
+    for file in dir_iter.flatten() {
+        if file
+            .file_name()
+            .to_ascii_lowercase()
+            .to_string_lossy()
+            .ends_with("parquet")
+        {
+            files.push(file.path());
+        }
+    }
+
+    files
+}
+
+fn parquet_reader(file: &PathBuf) -> Vec<Result<Row, ParquetError>> {
+    let pq_file = std::fs::File::open(file).unwrap();
+    let reader = SerializedFileReader::new(pq_file).unwrap();
+    reader
+        .get_row_iter(None)
+        .unwrap()
+        .collect::<Vec<Result<Row, ParquetError>>>()
+}
+
+fn main() {
+    let args = Args::parse();
+
+    if let Some(threads) = args.num_threads
+        && args.parallel
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads as usize)
+            .build_global()
+            .unwrap();
+    }
+
+    let mut file_names = Container::new(args.bloomfilter, args.parallel);
+
+    let outfile = std::fs::File::create_new(&args.output).unwrap();
+    let buf = std::io::BufWriter::new(outfile);
+
+    let left_metadata = fs::metadata(&args.left).unwrap();
+    let left_file_type = left_metadata.file_type();
+
+    // left file/dir is our base we open it/all of them and hold it in the set/filter
+    if left_file_type.is_file() {
+        let file_path = PathBuf::from(&args.left);
+        let mut rows = parquet_reader(&file_path);
+        println!("opened file: {} to check against", args.left);
+        if args.parallel {
+            let all_file_names = rows
+                .into_par_iter()
+                .fold(|| HashSet::new(),
+                    |mut local_names, record| {
+                    if let Ok(file_name) = record.unwrap().get_string(0).cloned() {
+                        local_names.insert(file_name);
+                    } else {};
+
+                    local_names
+                }).reduce(|| HashSet::new(),
+                |mut global, locals| {
+                    for file_name in locals {
+                        global.insert(file_name);
+                    }
+
+                    global
+                });
+            
+            file_names.extend(all_file_names.iter());
+        } else {
+            while let Some(record) = rows.pop() {
+                if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
+                    file_names.insert(file_name.clone());
+                }
+            }
+        }
+    } else {
+        // dir crawl and open all parquet files if this is a directory
+        let files = find_parquet_files(args.left);
+        if args.parallel {
+            let collect_files = files
+                .into_par_iter()
+                .map(|file| {
+                    let rows = parquet_reader(&file);
+                    println!("opened file: {} to check against", file.to_string_lossy());
+
+                    rows.into_par_iter()
+                        .map(|record| match record.as_ref().unwrap().get_string(0) {
+                            Ok(file_name) => file_name.to_owned(),
+                            _ => String::new(),
+                        })
+                        .filter(|x| !x.is_empty())
+                        .collect::<Vec<String>>()
+                })
+                .collect::<Vec<Vec<String>>>();
+
+            file_names.extend(collect_files.iter().flatten());
+        } else {
+            for file in files {
+                let mut rows = parquet_reader(&file);
+                println!("opened file: {} to check against", file.to_string_lossy());
+
+                while let Some(record) = rows.pop() {
+                    if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
+                        file_names.insert(file_name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Done opening base files");
+
+    let right_metadata = fs::metadata(&args.right).unwrap();
+    let right_file_type = right_metadata.file_type();
+
+    // then check each file in the right dir and keep track of missing files
+    let mut missing_files: HashSet<String> = HashSet::new();
+
+    if right_file_type.is_file() {
+        let file_path = PathBuf::from(&args.right);
+        let mut rows = parquet_reader(&file_path);
+        println!("Opened file {} to compare", args.right);
+        if args.parallel {
+            let temp = rows
+                .into_par_iter()
+                .map(|record| match record.as_ref().unwrap().get_string(0) {
+                    Ok(file_name) => file_name.to_owned(),
+                    _ => String::new(),
+                })
+                .filter(|x| !x.is_empty())
+                .collect::<Vec<String>>();
+
+            file_names.extend(temp.iter());
+        } else {
+            while let Some(record) = rows.pop() {
+                if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
+                    file_names.insert(file_name.clone());
+                }
+            }
+        }
+    } else {
+        // right is a directory so we must directory crawl
+        let files = find_parquet_files(args.right);
+
+        if args.parallel {
+            let missing = files
+                .into_par_iter()
+                .map(|file| {
+                    let rows = parquet_reader(&file);
+                    println!("opened file: {} to check against", file.to_string_lossy());
+
+                    rows.into_par_iter()
+                        .map(|record| match record.as_ref().unwrap().get_string(0) {
+                            Ok(file_name) => file_name.to_owned(),
+                            _ => String::new(),
+                        })
+                        .filter(|x| !file_names.contains(x))
+                        .collect::<Vec<String>>()
+                })
+                .collect::<Vec<Vec<String>>>();
+
+            missing_files.extend(missing.into_iter().flatten());
+        } else {
+            for file in files {
+                let mut rows = parquet_reader(&file);
+                println!("opened file: {} to compare", file.to_string_lossy());
+
+                while let Some(record) = rows.pop() {
+                    if let Ok(file_name) = record.as_ref().unwrap().get_string(0)
+                        && !file_names.contains(file_name)
+                    {
+                        missing_files.insert(file_name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Done comparing files\n######################");
+
+    serde_json::to_writer_pretty(buf, &missing_files).unwrap();
+    println!("successfully wrote missing files to: {}", args.output);
+}
