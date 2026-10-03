@@ -14,7 +14,9 @@ use parquet::{
     file::reader::{FileReader, SerializedFileReader},
     record::{Row, RowAccessor},
 };
-use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
+use rayon::iter::{
+    IntoParallelIterator, IntoParallelRefIterator, ParallelBridge, ParallelIterator,
+};
 use thiserror::Error;
 
 enum Container<T> {
@@ -200,7 +202,7 @@ fn main() -> Result<(), Error> {
             .build_global()?;
     }
 
-    let mut file_names = Container::new(args.bloomfilter, args.parallel);
+    let mut file_names = Mutex::new(Container::new(args.bloomfilter, args.parallel));
 
     let outfile = std::fs::File::create_new(&args.output)?;
     let buf = std::io::BufWriter::new(outfile);
@@ -214,33 +216,16 @@ fn main() -> Result<(), Error> {
         let mut rows = parquet_reader(&file_path)?;
         println!("opened file: {} to check against", args.left);
         if args.parallel {
-            let all_file_names = rows
-                .into_par_iter()
-                .fold(
-                    || AtomicBloomFilter::with_false_pos(0.001).expected_items(2_000_000_000),
-                    |local_names, record| {
-                        // TODO handle this a little safer
-                        if let Ok(file_name) = record.unwrap().get_string(0).cloned() {
-                            local_names.insert(&file_name);
-                        }
-
-                        local_names
-                    },
-                )
-                .reduce(
-                    || AtomicBloomFilter::with_false_pos(0.001).expected_items(2_000_000_000),
-                    |global, locals| {
-                        global.union(&locals);
-
-                        global
-                    },
-                );
-
-            file_names.try_union(all_file_names);
+            rows.into_par_iter().for_each(|record| {
+                // TODO handle this a little safer
+                if let Ok(file_name) = record.unwrap().get_string(0).cloned() {
+                    file_names.lock().unwrap().insert(file_name);
+                }
+            });
         } else {
             while let Some(record) = rows.pop() {
                 if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
-                    file_names.insert(file_name.clone());
+                    file_names.lock().unwrap().insert(file_name.clone());
                 }
             }
         }
@@ -249,65 +234,33 @@ fn main() -> Result<(), Error> {
         let files = find_parquet_files(&args.left)?;
         if args.parallel {
             //todo return result from closure to handle errors better?
-            let all_file_names = files
-                .into_par_iter()
-                .map(|file_handle| {
-                    let file = fs::File::open(&file_handle).unwrap();
-                    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-                    let reader = builder.with_batch_size(8192).build().unwrap();
+            let all_file_names = files.into_par_iter().map(|file_handle| {
+                let file = fs::File::open(&file_handle).unwrap();
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+                let reader = builder.with_batch_size(8192).build().unwrap();
 
-                    //let mut rows = parquet_reader(&file);
-                    println!("opened file: {} to check against", file_handle.display());
-                    reader
+                //let mut rows = parquet_reader(&file);
+                println!("opened file: {} to check against", file_handle.display());
+                reader.par_bridge().for_each(|record| {
+                    let record_batch = record.unwrap();
+
+                    let record_arrays = record_batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+
+                    record_arrays
+                        .iter()
                         .par_bridge()
                         .into_par_iter()
-                        .fold(
-                            || {
-                                AtomicBloomFilter::with_false_pos(0.001)
-                                    .expected_items(2_000_000_000)
-                            },
-                            |local_names, record| {
-                                let record_batch = record.unwrap();
-
-                                let record_arrays = record_batch
-                                    .column(0)
-                                    .as_any()
-                                    .downcast_ref::<StringArray>()
-                                    .unwrap();
-
-                                record_arrays.iter().par_bridge().into_par_iter().for_each(
-                                    |record| {
-                                        if let Some(file_name) = record {
-                                            local_names.insert(file_name);
-                                        }
-                                    },
-                                );
-
-                                local_names
-                            },
-                        )
-                        .reduce(
-                            || {
-                                AtomicBloomFilter::with_false_pos(0.001)
-                                    .expected_items(2_000_000_000)
-                            },
-                            |global, locals| {
-                                global.union(&locals);
-
-                                global
-                            },
-                        )
+                        .for_each(|record| {
+                            if let Some(file_name) = record {
+                                file_names.lock().unwrap().insert(file_name.to_string());
+                            }
+                        });
                 })
-                .reduce(
-                    || AtomicBloomFilter::with_false_pos(0.001).expected_items(2_000_000_000),
-                    |global, locals| {
-                        global.union(&locals);
-
-                        global
-                    },
-                );
-
-            file_names.try_union(all_file_names);
+            });
         } else {
             for file in files {
                 let mut rows = parquet_reader(&file)?;
@@ -315,7 +268,7 @@ fn main() -> Result<(), Error> {
 
                 while let Some(record) = rows.pop() {
                     if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
-                        file_names.insert(file_name.clone());
+                        file_names.lock().unwrap().insert(file_name.clone());
                     }
                 }
             }
@@ -344,11 +297,11 @@ fn main() -> Result<(), Error> {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<String>>();
 
-            file_names.extend(temp.iter());
+            file_names.lock().unwrap().extend(temp.iter());
         } else {
             while let Some(record) = rows.pop() {
                 if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
-                    file_names.insert(file_name.clone());
+                    file_names.lock().unwrap().insert(file_name.clone());
                 }
             }
         }
@@ -383,7 +336,7 @@ fn main() -> Result<(), Error> {
                                 .into_par_iter()
                                 .filter(|x| x.is_some())
                                 .map(|z| z.unwrap())
-                                .filter(|y| !file_names.contains(*y))
+                                .filter(|y| !file_names.lock().unwrap().contains(*y))
                                 .fold(HashSet::new, |mut missing_files, x| {
                                     missing_files.insert(x.to_string());
 
@@ -419,7 +372,7 @@ fn main() -> Result<(), Error> {
 
                 while let Some(record) = rows.pop() {
                     if let Ok(file_name) = record.as_ref().unwrap().get_string(0)
-                        && !file_names.contains(file_name)
+                        && !file_names.lock().unwrap().contains(file_name)
                     {
                         missing_files.insert(file_name.to_string());
                     }
