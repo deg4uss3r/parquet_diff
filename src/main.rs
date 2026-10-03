@@ -15,6 +15,7 @@ use parquet::{
     record::{Row, RowAccessor},
 };
 use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
+use thiserror::Error;
 
 enum Container<T> {
     Hash(HashSet<T>),
@@ -70,14 +71,12 @@ impl<T: Hash + Eq> Container<T> {
     }
 
     fn try_union(&mut self, bloom: AtomicBloomFilter) {
-        match self {
-            Container::ParBloom(filter) => filter.union(&bloom),
-            _ => (),
+        if let Container::ParBloom(filter) = self {
+            filter.union(&bloom)
         }
     }
 }
 
-// woooo boy this is a little crazy but works for this specific use case
 impl<'a, T: Hash + Eq + Clone + 'a> Container<T> {
     fn extend<Q: IntoIterator<Item = &'a T> + Iterator<Item = &'a T>>(&mut self, value: Q)
     where
@@ -118,6 +117,17 @@ impl<T: Hash + Eq> From<AtomicBloomFilter> for Container<T> {
         Container::ParBloom(value)
     }
 }
+#[derive(Debug, Error)]
+enum Error {
+    #[error("Error opening file")]
+    Reading(#[from] std::io::Error),
+    #[error("Error writing to file")]
+    Writing(#[from] serde_json::Error),
+    #[error("Error with parquet file")]
+    Parquet(#[from] ParquetError),
+    #[error("Error setting up parallelization")]
+    Threading(#[from] rayon::ThreadPoolBuildError),
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -151,8 +161,8 @@ struct Args {
     num_threads: Option<u32>,
 }
 
-fn find_parquet_files(dir: &String) -> Vec<PathBuf> {
-    let dir_iter = std::fs::read_dir(Path::new(dir)).unwrap();
+fn find_parquet_files(dir: &String) -> Result<Vec<PathBuf>, Error> {
+    let dir_iter = std::fs::read_dir(Path::new(dir))?;
     let mut files = vec![];
 
     for file in dir_iter.flatten() {
@@ -166,19 +176,19 @@ fn find_parquet_files(dir: &String) -> Vec<PathBuf> {
         }
     }
 
-    files
+    Ok(files)
 }
 
-fn parquet_reader(file: &PathBuf) -> Vec<Result<Row, ParquetError>> {
-    let pq_file = std::fs::File::open(file).unwrap();
-    let reader = SerializedFileReader::new(pq_file).unwrap();
-    reader
-        .get_row_iter(None)
-        .unwrap()
-        .collect::<Vec<Result<Row, ParquetError>>>()
+fn parquet_reader(file: &PathBuf) -> Result<Vec<Result<Row, ParquetError>>, Error> {
+    let pq_file = std::fs::File::open(file)?;
+    let reader = SerializedFileReader::new(pq_file)?;
+
+    Ok(reader
+        .get_row_iter(None)?
+        .collect::<Vec<Result<Row, ParquetError>>>())
 }
 
-fn main() {
+fn main() -> Result<(), Error> {
     let args = Args::parse();
 
     if let Some(threads) = args.num_threads
@@ -187,22 +197,21 @@ fn main() {
         println!("Using {threads} threads");
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads as usize)
-            .build_global()
-            .unwrap();
+            .build_global()?;
     }
 
     let mut file_names = Container::new(args.bloomfilter, args.parallel);
 
-    let outfile = std::fs::File::create_new(&args.output).unwrap();
+    let outfile = std::fs::File::create_new(&args.output)?;
     let buf = std::io::BufWriter::new(outfile);
 
-    let left_metadata = fs::metadata(&args.left).unwrap();
+    let left_metadata = fs::metadata(&args.left)?;
     let left_file_type = left_metadata.file_type();
 
     // left file/dir is our base we open it/all of them and hold it in the set/filter
     if left_file_type.is_file() {
         let file_path = PathBuf::from(&args.left);
-        let mut rows = parquet_reader(&file_path);
+        let mut rows = parquet_reader(&file_path)?;
         println!("opened file: {} to check against", args.left);
         if args.parallel {
             let all_file_names = rows
@@ -210,6 +219,7 @@ fn main() {
                 .fold(
                     || AtomicBloomFilter::with_false_pos(0.001).expected_items(2_000_000_000),
                     |local_names, record| {
+                        // TODO handle this a little safer
                         if let Ok(file_name) = record.unwrap().get_string(0).cloned() {
                             local_names.insert(&file_name);
                         }
@@ -236,8 +246,9 @@ fn main() {
         }
     } else {
         // dir crawl and open all parquet files if this is a directory
-        let files = find_parquet_files(&args.left);
+        let files = find_parquet_files(&args.left)?;
         if args.parallel {
+            //todo return result from closure to handle errors better?
             let all_file_names = files
                 .into_par_iter()
                 .map(|file_handle| {
@@ -299,7 +310,7 @@ fn main() {
             file_names.try_union(all_file_names);
         } else {
             for file in files {
-                let mut rows = parquet_reader(&file);
+                let mut rows = parquet_reader(&file)?;
                 println!("opened file: {} to check against", file.to_string_lossy());
 
                 while let Some(record) = rows.pop() {
@@ -313,7 +324,7 @@ fn main() {
 
     println!("Done opening base files");
 
-    let right_metadata = fs::metadata(&args.right).unwrap();
+    let right_metadata = fs::metadata(&args.right)?;
     let right_file_type = right_metadata.file_type();
 
     // then check each file in the right dir and keep track of missing files
@@ -321,7 +332,7 @@ fn main() {
 
     if right_file_type.is_file() {
         let file_path = PathBuf::from(&args.right);
-        let mut rows = parquet_reader(&file_path);
+        let mut rows = parquet_reader(&file_path)?;
         println!("Opened file {} to compare", args.right);
         if args.parallel {
             let temp = rows
@@ -343,9 +354,10 @@ fn main() {
         }
     } else {
         // right is a directory so we must directory crawl
-        let files = find_parquet_files(&args.right);
+        let files = find_parquet_files(&args.right)?;
 
         if args.parallel {
+            // TODO return result from closure to handle errors better?
             let missing = files
                 .into_par_iter()
                 .map(|file_handle| {
@@ -402,7 +414,7 @@ fn main() {
             missing_files = missing;
         } else {
             for file in files {
-                let mut rows = parquet_reader(&file);
+                let mut rows = parquet_reader(&file)?;
                 println!("opened file: {} to compare", file.to_string_lossy());
 
                 while let Some(record) = rows.pop() {
@@ -418,6 +430,8 @@ fn main() {
 
     println!("Done comparing files\n######################");
 
-    serde_json::to_writer_pretty(buf, &missing_files).unwrap();
+    serde_json::to_writer_pretty(buf, &missing_files)?;
     println!("successfully wrote missing files to: {}", args.output);
+
+    Ok(())
 }
