@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::fs;
 use std::hash::Hash;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -15,9 +16,12 @@ use parquet::{
     record::{Row, RowAccessor},
 };
 use rayon::iter::{
-    IntoParallelIterator, IntoParallelRefIterator, ParallelBridge, ParallelIterator,
+    IntoParallelIterator, ParallelBridge, ParallelIterator,
 };
 use thiserror::Error;
+
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 enum Container<T> {
     Hash(HashSet<T>),
@@ -69,12 +73,6 @@ impl<T: Hash + Eq> Container<T> {
             }
             (false, true) => Self::ParHash(Mutex::new(HashSet::new())),
             (false, false) => Self::Hash(HashSet::new()),
-        }
-    }
-
-    fn try_union(&mut self, bloom: AtomicBloomFilter) {
-        if let Container::ParBloom(filter) = self {
-            filter.union(&bloom)
         }
     }
 }
@@ -158,9 +156,14 @@ struct Args {
 
     /// number of threads to use
     /// warning if not supplied it will use them all, depending on how much data you are parsing
-    /// this will probably eat all of your RAM quickly...
+    /// this will probably eat all of your CPU
     #[arg(short, long)]
     num_threads: Option<u32>,
+
+    /// size of bytes to read at a single time from parquet files
+    /// default: 8192 (8KB)
+    #[arg(short, long, default_value_t = 8192)]
+    blocks: usize,
 }
 
 fn find_parquet_files(dir: &String) -> Result<Vec<PathBuf>, Error> {
@@ -202,10 +205,9 @@ fn main() -> Result<(), Error> {
             .build_global()?;
     }
 
-    let mut file_names = Mutex::new(Container::new(args.bloomfilter, args.parallel));
+    let file_names = Mutex::new(Container::new(args.bloomfilter, args.parallel));
 
     let outfile = std::fs::File::create_new(&args.output)?;
-    let buf = std::io::BufWriter::new(outfile);
 
     let left_metadata = fs::metadata(&args.left)?;
     let left_file_type = left_metadata.file_type();
@@ -234,14 +236,14 @@ fn main() -> Result<(), Error> {
         let files = find_parquet_files(&args.left)?;
         if args.parallel {
             //todo return result from closure to handle errors better?
-            let all_file_names = files.into_par_iter().map(|file_handle| {
+            files.into_iter().for_each(|file_handle| {
                 let file = fs::File::open(&file_handle).unwrap();
                 let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-                let reader = builder.with_batch_size(8192).build().unwrap();
+                let reader = builder.with_batch_size(args.blocks).build().unwrap();
 
                 //let mut rows = parquet_reader(&file);
                 println!("opened file: {} to check against", file_handle.display());
-                reader.par_bridge().for_each(|record| {
+                reader.into_iter().par_bridge().for_each(|record| {
                     let record_batch = record.unwrap();
 
                     let record_arrays = record_batch
@@ -251,9 +253,8 @@ fn main() -> Result<(), Error> {
                         .unwrap();
 
                     record_arrays
-                        .iter()
+                        .into_iter()
                         .par_bridge()
-                        .into_par_iter()
                         .for_each(|record| {
                             if let Some(file_name) = record {
                                 file_names.lock().unwrap().insert(file_name.to_string());
@@ -281,7 +282,7 @@ fn main() -> Result<(), Error> {
     let right_file_type = right_metadata.file_type();
 
     // then check each file in the right dir and keep track of missing files
-    let mut missing_files: HashSet<String> = HashSet::new();
+    let missing_files: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
 
     if right_file_type.is_file() {
         let file_path = PathBuf::from(&args.right);
@@ -311,60 +312,43 @@ fn main() -> Result<(), Error> {
 
         if args.parallel {
             // TODO return result from closure to handle errors better?
-            let missing = files
-                .into_par_iter()
-                .map(|file_handle| {
+            files
+                .into_iter()
+                .for_each(|file_handle| {
                     let file = fs::File::open(&file_handle).unwrap();
                     let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-                    let reader = builder.with_batch_size(20000).build().unwrap();
+                    let reader = builder.with_batch_size(args.blocks).build().unwrap();
 
                     println!("opened file: {} to check against", file_handle.display());
                     reader
+                        .into_iter()
                         .par_bridge()
-                        .into_par_iter()
-                        .map(|record| {
+                        .for_each(|record| {
                             let record_batch = record.unwrap();
                             let record_arrays = record_batch
-                                .column(0)
+                                .column_by_name("Object_Name")
+                                .unwrap()
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap();
+
+                            let filesize_arrays = record_batch
+                                .column_by_name("Size_Bytes")
+                                .unwrap()
                                 .as_any()
                                 .downcast_ref::<StringArray>()
                                 .unwrap();
 
                             record_arrays
-                                .iter()
+                                .into_iter()
+                                .zip(filesize_arrays.into_iter())
                                 .par_bridge()
-                                .into_par_iter()
-                                .filter(|x| x.is_some())
-                                .map(|z| z.unwrap())
-                                .filter(|y| !file_names.lock().unwrap().contains(*y))
-                                .fold(HashSet::new, |mut missing_files, x| {
-                                    missing_files.insert(x.to_string());
-
-                                    missing_files
-                                })
-                                .reduce(HashSet::new, |mut global, locals| {
-                                    global.extend(locals);
-
-                                    global
-                                })
-                        })
-                        .fold(HashSet::new, |mut local_missing, missing_file| {
-                            local_missing.extend(missing_file);
-                            local_missing
-                        })
-                        .reduce(HashSet::new, |mut global, locals| {
-                            global.extend(locals);
-
-                            global
-                        })
-                })
-                .reduce(HashSet::new, |mut global, locals| {
-                    global.extend(locals);
-
-                    global
+                                .filter(|(file_name, file_size) | file_name.is_some() && !file_names.lock().unwrap().contains(file_name.unwrap()))
+                                .for_each(|(missing_file, file_size)| {
+                                    missing_files.lock().unwrap().insert(format!("{},{}", missing_file.unwrap(), file_size.unwrap()));
+                                });
+                        });
                 });
-
-            missing_files = missing;
         } else {
             for file in files {
                 let mut rows = parquet_reader(&file)?;
@@ -374,7 +358,7 @@ fn main() -> Result<(), Error> {
                     if let Ok(file_name) = record.as_ref().unwrap().get_string(0)
                         && !file_names.lock().unwrap().contains(file_name)
                     {
-                        missing_files.insert(file_name.to_string());
+                        missing_files.lock().unwrap().insert(file_name.to_string());
                     }
                 }
             }
@@ -383,7 +367,22 @@ fn main() -> Result<(), Error> {
 
     println!("Done comparing files\n######################");
 
-    serde_json::to_writer_pretty(buf, &missing_files)?;
+    // finally open the output file for writing
+    // 8MB pages
+    let mut buf = std::io::BufWriter::new( outfile);
+    // pull out of the mutex to not be limited by disk I/O contention
+    buf.write_all(b"file_name,file_size(bytes)\n")?;
+    let contents = {
+        let mut lock = missing_files.lock().unwrap();
+        std::mem::take(&mut *lock) 
+    };
+    
+    for line in contents.into_iter() {
+        buf.write_all(line.as_bytes())?;
+        buf.write_all(b"\n")?;
+    }
+    
+    buf.flush()?;
     println!("successfully wrote missing files to: {}", args.output);
 
     Ok(())

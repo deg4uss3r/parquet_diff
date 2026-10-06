@@ -14,3 +14,11 @@ string-interner = "0.20.0"
 arrow-array = "60.0.0"
 arrow = "60.0.0"
 thiserror = "2.0.0"
+tikv-jemallocator = "0.7.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols" 
