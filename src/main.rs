@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use arrow::array::{Array, StringArray};
+use arrow_array::Int64Array;
 use clap::Parser;
 use fastbloom::{AtomicBloomFilter, BloomFilter};
 use hashbrown::HashSet;
@@ -336,7 +337,7 @@ fn main() -> Result<(), Error> {
                                 .column_by_name("Size_Bytes")
                                 .unwrap()
                                 .as_any()
-                                .downcast_ref::<StringArray>()
+                                .downcast_ref::<Int64Array>()
                                 .unwrap();
 
                             record_arrays
