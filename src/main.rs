@@ -4,9 +4,13 @@ use std::hash::Hash;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::mpsc::channel;
 
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, AsArray, StringArray};
+use arrow::datatypes::{GenericStringType, Int64Type};
+use arrow_array::{Datum, GenericBinaryArray, GenericByteArray};
 use clap::Parser;
+use clap::builder::Str;
 use fastbloom::{AtomicBloomFilter, BloomFilter};
 use hashbrown::HashSet;
 use parquet::{
@@ -266,7 +270,7 @@ fn main() -> Result<(), Error> {
                     if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
                         file_names.lock().unwrap().insert(file_name.clone());
                     }
-                }
+                } 
             }
         }
     }
@@ -305,44 +309,52 @@ fn main() -> Result<(), Error> {
         // right is a directory so we must directory crawl
         let files = find_parquet_files(&args.right)?;
 
+    
+        let mut buf = std::io::BufWriter::new(outfile);
+        buf.write_all(b"file_name,file_size(bytes)\n")?;
+
+    println!("successfully wrote missing files to: {}", args.output);
+
         if args.parallel {
+                    use std::sync::mpsc::channel;
+        let (tx, rx) = channel::<String>();
+                            let write_thread = std::thread::spawn(move || {
+                    for line in rx {
+                        buf.write_all(line.as_bytes()).unwrap();
+                    }
+                });
+
             // TODO return result from closure to handle errors better?
             files.into_iter().for_each(|file_handle| {
                 let file = fs::File::open(&file_handle).unwrap();
                 let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
                 let reader = builder.with_batch_size(args.blocks).build().unwrap();
 
+
+
                 println!("opened file: {} to check against", file_handle.display());
-                reader.into_iter().par_bridge().for_each(|record| {
+                reader.into_iter().par_bridge().for_each_with(tx.clone(), |tx, record| {
                     let record_batch = record.unwrap();
 
-                    let records = record_batch
-                        .columns()
-                        .iter()
-                        .map(|row| {
-                            let columns = row.slice(0, 1);
-                            let column_array =
-                                columns.as_any().downcast_ref::<StringArray>().unwrap();
-                            (
-                                column_array.value(0).to_owned(),
-                                column_array.value(1).to_owned(),
-                            )
-                        })
-                        .collect::<Vec<(String, String)>>();
+                    // I want to get columns 0,1 check if it is in the files
+                    // then write out directly form this iterator instead of
+                    // using the intermediatory HashSet
+                    let file_name_col = record_batch
+                        .column(0)
+                        .as_string::<i32>();
+                    let file_size_col = record_batch.column(1).as_primitive::<Int64Type>();
 
-                    records
-                        .into_par_iter()
-                        .filter(|(file_name, _file_size)| {
-                            !file_names.lock().unwrap().contains(file_name)
-                        })
-                        .for_each(|(missing_file, file_size)| {
-                            missing_files
-                                .lock()
-                                .unwrap()
-                                .insert(format!("{},{}", missing_file, file_size));
-                        });
+                    for row in 0..record_batch.num_rows() {
+                        let file_name = file_name_col.value(row).to_string();
+                        if !file_names.lock().unwrap().contains(&file_name) {
+                            let line = format!("{file_name},{}", file_size_col.value(row).to_string());
+                            tx.send(line).unwrap();
+                        }
+                    }
                 });
             });
+
+            write_thread.join().unwrap();
         } else {
             for file in files {
                 let mut rows = parquet_reader(&file)?;
@@ -361,23 +373,7 @@ fn main() -> Result<(), Error> {
 
     println!("Done comparing files\n######################");
 
-    // finally open the output file for writing
-    // 8MB pages
-    let mut buf = std::io::BufWriter::new(outfile);
-    // pull out of the mutex to not be limited by disk I/O contention
-    buf.write_all(b"file_name,file_size(bytes)\n")?;
-    let contents = {
-        let mut lock = missing_files.lock().unwrap();
-        std::mem::take(&mut *lock)
-    };
 
-    for line in contents.into_iter() {
-        buf.write_all(line.as_bytes())?;
-        buf.write_all(b"\n")?;
-    }
-
-    buf.flush()?;
-    println!("successfully wrote missing files to: {}", args.output);
 
     Ok(())
 }
