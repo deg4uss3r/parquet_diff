@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use arrow::array::{Array, StringArray};
-use arrow_array::Int64Array;
 use clap::Parser;
 use fastbloom::{AtomicBloomFilter, BloomFilter};
 use hashbrown::HashSet;
@@ -16,9 +15,7 @@ use parquet::{
     file::reader::{FileReader, SerializedFileReader},
     record::{Row, RowAccessor},
 };
-use rayon::iter::{
-    IntoParallelIterator, ParallelBridge, ParallelIterator,
-};
+use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 use thiserror::Error;
 
 #[global_allocator]
@@ -253,14 +250,11 @@ fn main() -> Result<(), Error> {
                         .downcast_ref::<StringArray>()
                         .unwrap();
 
-                    record_arrays
-                        .into_iter()
-                        .par_bridge()
-                        .for_each(|record| {
-                            if let Some(file_name) = record {
-                                file_names.lock().unwrap().insert(file_name.to_string());
-                            }
-                        });
+                    record_arrays.into_iter().par_bridge().for_each(|record| {
+                        if let Some(file_name) = record {
+                            file_names.lock().unwrap().insert(file_name.to_string());
+                        }
+                    });
                 })
             });
         } else {
@@ -313,43 +307,42 @@ fn main() -> Result<(), Error> {
 
         if args.parallel {
             // TODO return result from closure to handle errors better?
-            files
-                .into_iter()
-                .for_each(|file_handle| {
-                    let file = fs::File::open(&file_handle).unwrap();
-                    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-                    let reader = builder.with_batch_size(args.blocks).build().unwrap();
+            files.into_iter().for_each(|file_handle| {
+                let file = fs::File::open(&file_handle).unwrap();
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+                let reader = builder.with_batch_size(args.blocks).build().unwrap();
 
-                    println!("opened file: {} to check against", file_handle.display());
-                    reader
-                        .into_iter()
-                        .par_bridge()
-                        .for_each(|record| {
-                            let record_batch = record.unwrap();
-                            let record_arrays = record_batch
-                                .column_by_name("Object_Name")
+                println!("opened file: {} to check against", file_handle.display());
+                reader.into_iter().par_bridge().for_each(|record| {
+                    let record_batch = record.unwrap();
+
+                    let records = record_batch
+                        .columns()
+                        .iter()
+                        .map(|row| {
+                            let columns = row.slice(0, 1);
+                            let column_array =
+                                columns.as_any().downcast_ref::<StringArray>().unwrap();
+                            (
+                                column_array.value(0).to_owned(),
+                                column_array.value(1).to_owned(),
+                            )
+                        })
+                        .collect::<Vec<(String, String)>>();
+
+                    records
+                        .into_par_iter()
+                        .filter(|(file_name, _file_size)| {
+                            !file_names.lock().unwrap().contains(file_name)
+                        })
+                        .for_each(|(missing_file, file_size)| {
+                            missing_files
+                                .lock()
                                 .unwrap()
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .unwrap();
-
-                            let filesize_arrays = record_batch
-                                .column_by_name("Size_Bytes")
-                                .unwrap()
-                                .as_any()
-                                .downcast_ref::<Int64Array>()
-                                .unwrap();
-
-                            record_arrays
-                                .into_iter()
-                                .zip(filesize_arrays.into_iter())
-                                .par_bridge()
-                                .filter(|(file_name, file_size) | file_name.is_some() && !file_names.lock().unwrap().contains(file_name.unwrap()))
-                                .for_each(|(missing_file, file_size)| {
-                                    missing_files.lock().unwrap().insert(format!("{},{}", missing_file.unwrap(), file_size.unwrap()));
-                                });
+                                .insert(format!("{},{}", missing_file, file_size));
                         });
                 });
+            });
         } else {
             for file in files {
                 let mut rows = parquet_reader(&file)?;
@@ -370,19 +363,19 @@ fn main() -> Result<(), Error> {
 
     // finally open the output file for writing
     // 8MB pages
-    let mut buf = std::io::BufWriter::new( outfile);
+    let mut buf = std::io::BufWriter::new(outfile);
     // pull out of the mutex to not be limited by disk I/O contention
     buf.write_all(b"file_name,file_size(bytes)\n")?;
     let contents = {
         let mut lock = missing_files.lock().unwrap();
-        std::mem::take(&mut *lock) 
+        std::mem::take(&mut *lock)
     };
-    
+
     for line in contents.into_iter() {
         buf.write_all(line.as_bytes())?;
         buf.write_all(b"\n")?;
     }
-    
+
     buf.flush()?;
     println!("successfully wrote missing files to: {}", args.output);
 
