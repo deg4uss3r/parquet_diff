@@ -4,13 +4,10 @@ use std::hash::Hash;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::mpsc::channel;
 
 use arrow::array::{Array, AsArray, StringArray};
-use arrow::datatypes::{GenericStringType, Int64Type};
-use arrow_array::{Datum, GenericBinaryArray, GenericByteArray};
+use arrow::datatypes::Int64Type;
 use clap::Parser;
-use clap::builder::Str;
 use fastbloom::{AtomicBloomFilter, BloomFilter};
 use hashbrown::HashSet;
 use parquet::{
@@ -270,7 +267,7 @@ fn main() -> Result<(), Error> {
                     if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
                         file_names.lock().unwrap().insert(file_name.clone());
                     }
-                } 
+                }
             }
         }
     }
@@ -309,20 +306,19 @@ fn main() -> Result<(), Error> {
         // right is a directory so we must directory crawl
         let files = find_parquet_files(&args.right)?;
 
-    
-        let mut buf = std::io::BufWriter::new(outfile);
+        let mut buf = std::io::LineWriter::new(outfile);
         buf.write_all(b"file_name,file_size(bytes)\n")?;
 
-    println!("successfully wrote missing files to: {}", args.output);
+        println!("successfully wrote missing files to: {}", args.output);
 
         if args.parallel {
-                    use std::sync::mpsc::channel;
-        let (tx, rx) = channel::<String>();
-                            let write_thread = std::thread::spawn(move || {
-                    for line in rx {
-                        buf.write_all(line.as_bytes()).unwrap();
-                    }
-                });
+            use std::sync::mpsc::channel;
+            let (tx, rx) = channel::<String>();
+            let write_thread = std::thread::spawn(move || {
+                for line in rx {
+                    buf.write_all(line.as_bytes()).unwrap();
+                }
+            });
 
             // TODO return result from closure to handle errors better?
             files.into_iter().for_each(|file_handle| {
@@ -330,31 +326,32 @@ fn main() -> Result<(), Error> {
                 let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
                 let reader = builder.with_batch_size(args.blocks).build().unwrap();
 
-
-
                 println!("opened file: {} to check against", file_handle.display());
-                reader.into_iter().par_bridge().for_each_with(tx.clone(), |tx, record| {
-                    let record_batch = record.unwrap();
+                reader
+                    .into_iter()
+                    .par_bridge()
+                    .for_each_with(tx.clone(), |tx, record| {
+                        let record_batch = record.unwrap();
 
-                    // I want to get columns 0,1 check if it is in the files
-                    // then write out directly form this iterator instead of
-                    // using the intermediatory HashSet
-                    let file_name_col = record_batch
-                        .column(0)
-                        .as_string::<i32>();
-                    let file_size_col = record_batch.column(1).as_primitive::<Int64Type>();
+                        let file_name_col = record_batch.column(0).as_string::<i32>();
+                        let file_size_col = record_batch.column(1).as_primitive::<Int64Type>();
 
-                    for row in 0..record_batch.num_rows() {
-                        let file_name = file_name_col.value(row).to_string();
-                        if !file_names.lock().unwrap().contains(&file_name) {
-                            let line = format!("{file_name},{}", file_size_col.value(row).to_string());
-                            tx.send(line).unwrap();
+                        for row in 0..record_batch.num_rows() {
+                            let file_name = file_name_col.value(row).to_string();
+                            if !file_names.lock().unwrap().contains(&file_name) {
+                                let line = format!(
+                                    "{file_name},{}\n",
+                                    file_size_col.value(row).to_string()
+                                );
+                                tx.send(line).unwrap();
+                            }
                         }
-                    }
-                });
+                    });
             });
 
+            println!("before join");
             write_thread.join().unwrap();
+            println!("after join");
         } else {
             for file in files {
                 let mut rows = parquet_reader(&file)?;
@@ -372,8 +369,6 @@ fn main() -> Result<(), Error> {
     }
 
     println!("Done comparing files\n######################");
-
-
 
     Ok(())
 }
