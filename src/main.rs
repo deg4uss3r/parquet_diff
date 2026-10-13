@@ -19,6 +19,7 @@ use parquet::{
 use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 use thiserror::Error;
 
+#[cfg(target_family = "unix")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
