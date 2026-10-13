@@ -4,10 +4,8 @@ permissions:
   contents: read
 
 on:
-  push:
-    tags:
-      - v[0-9]+.*
-
+  release:
+    types: [created]
 jobs:
   create-release:
     runs-on: ubuntu-latest
@@ -16,9 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/create-gh-release-action@v1
-        with:
-          # (optional) Path to changelog.
-          changelog: CHANGELOG.md
 
   upload-assets:
     needs: create-release
