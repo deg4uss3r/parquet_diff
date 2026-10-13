@@ -141,7 +141,7 @@ struct Args {
     #[arg(short, long)]
     right: String,
 
-    /// file to write the diff to (will output in a list, json format)
+    /// file to write the diff to (output will be file path,size(in bytes) csv format)
     #[arg(short, long)]
     output: String,
 
@@ -206,7 +206,11 @@ fn main() -> Result<(), Error> {
 
     let file_names = Mutex::new(Container::new(args.bloomfilter, args.parallel));
 
-    let outfile = std::fs::OpenOptions::new().create(true).write(true).open(&args.output)?;
+    let outfile = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&args.output)?;
 
     let left_metadata = fs::metadata(&args.left)?;
     let left_file_type = left_metadata.file_type();
@@ -309,7 +313,6 @@ fn main() -> Result<(), Error> {
         let mut buf = std::io::BufWriter::new(outfile);
         buf.write_all(b"file_name,file_size(bytes)\n")?;
 
-
         if args.parallel {
             use std::sync::mpsc::channel;
             let (tx, rx) = channel::<String>();
@@ -339,10 +342,7 @@ fn main() -> Result<(), Error> {
                         for row in 0..record_batch.num_rows() {
                             let file_name = file_name_col.value(row).to_string();
                             if !file_names.lock().unwrap().contains(&file_name) {
-                                let line = format!(
-                                    "{file_name},{}\n",
-                                    file_size_col.value(row).to_string()
-                                );
+                                let line = format!("{file_name},{}\n", file_size_col.value(row));
                                 tx.send(line).unwrap();
                             }
                         }
@@ -350,7 +350,7 @@ fn main() -> Result<(), Error> {
             });
 
             drop(tx);
-            let _ = write_thread.join().unwrap();
+            write_thread.join().unwrap();
             println!("successfully wrote missing files to: {}", args.output);
         } else {
             for file in files {
