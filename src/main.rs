@@ -206,7 +206,7 @@ fn main() -> Result<(), Error> {
 
     let file_names = Mutex::new(Container::new(args.bloomfilter, args.parallel));
 
-    let outfile = std::fs::File::create_new(&args.output)?;
+    let outfile = std::fs::OpenOptions::new().create(true).write(true).open(&args.output)?;
 
     let left_metadata = fs::metadata(&args.left)?;
     let left_file_type = left_metadata.file_type();
@@ -215,7 +215,7 @@ fn main() -> Result<(), Error> {
     if left_file_type.is_file() {
         let file_path = PathBuf::from(&args.left);
         let mut rows = parquet_reader(&file_path)?;
-        println!("opened file: {} to check against", args.left);
+        println!("Opened file: {} to build baseline", args.left);
         if args.parallel {
             rows.into_par_iter().for_each(|record| {
                 // TODO handle this a little safer
@@ -241,7 +241,7 @@ fn main() -> Result<(), Error> {
                 let reader = builder.with_batch_size(args.blocks).build().unwrap();
 
                 //let mut rows = parquet_reader(&file);
-                println!("opened file: {} to check against", file_handle.display());
+                println!("Opened file: {} to build baseline", file_handle.display());
                 reader.into_iter().par_bridge().for_each(|record| {
                     let record_batch = record.unwrap();
 
@@ -261,7 +261,7 @@ fn main() -> Result<(), Error> {
         } else {
             for file in files {
                 let mut rows = parquet_reader(&file)?;
-                println!("opened file: {} to check against", file.to_string_lossy());
+                println!("Opened file: {} to build baseline", file.to_string_lossy());
 
                 while let Some(record) = rows.pop() {
                     if let Ok(file_name) = record.as_ref().unwrap().get_string(0) {
@@ -272,7 +272,7 @@ fn main() -> Result<(), Error> {
         }
     }
 
-    println!("Done opening base files");
+    println!("Done opening base files\n");
 
     let right_metadata = fs::metadata(&args.right)?;
     let right_file_type = right_metadata.file_type();
@@ -283,7 +283,7 @@ fn main() -> Result<(), Error> {
     if right_file_type.is_file() {
         let file_path = PathBuf::from(&args.right);
         let mut rows = parquet_reader(&file_path)?;
-        println!("Opened file {} to compare", args.right);
+        println!("Opened file: {} to compare against", args.right);
         if args.parallel {
             let temp = rows
                 .into_par_iter()
@@ -306,10 +306,9 @@ fn main() -> Result<(), Error> {
         // right is a directory so we must directory crawl
         let files = find_parquet_files(&args.right)?;
 
-        let mut buf = std::io::LineWriter::new(outfile);
+        let mut buf = std::io::BufWriter::new(outfile);
         buf.write_all(b"file_name,file_size(bytes)\n")?;
 
-        println!("successfully wrote missing files to: {}", args.output);
 
         if args.parallel {
             use std::sync::mpsc::channel;
@@ -318,6 +317,7 @@ fn main() -> Result<(), Error> {
                 for line in rx {
                     buf.write_all(line.as_bytes()).unwrap();
                 }
+                buf.flush().unwrap();
             });
 
             // TODO return result from closure to handle errors better?
@@ -326,7 +326,7 @@ fn main() -> Result<(), Error> {
                 let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
                 let reader = builder.with_batch_size(args.blocks).build().unwrap();
 
-                println!("opened file: {} to check against", file_handle.display());
+                println!("Opened file: {} to check against", file_handle.display());
                 reader
                     .into_iter()
                     .par_bridge()
@@ -349,13 +349,13 @@ fn main() -> Result<(), Error> {
                     });
             });
 
-            println!("before join");
-            write_thread.join().unwrap();
-            println!("after join");
+            drop(tx);
+            let _ = write_thread.join().unwrap();
+            println!("successfully wrote missing files to: {}", args.output);
         } else {
             for file in files {
                 let mut rows = parquet_reader(&file)?;
-                println!("opened file: {} to compare", file.to_string_lossy());
+                println!("Opened file: {} to check against", file.to_string_lossy());
 
                 while let Some(record) = rows.pop() {
                     if let Ok(file_name) = record.as_ref().unwrap().get_string(0)
@@ -367,8 +367,6 @@ fn main() -> Result<(), Error> {
             }
         }
     }
-
-    println!("Done comparing files\n######################");
 
     Ok(())
 }
